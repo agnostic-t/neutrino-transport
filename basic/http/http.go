@@ -2,11 +2,11 @@ package http
 
 import (
 	"bufio"
-	"bytes"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/agnostic-t/neutrino-core/transport"
@@ -59,6 +59,9 @@ type HttpConn struct {
 	origin  string
 	host    string
 	keyPath string
+
+	w  *bufio.Writer
+	mu sync.Mutex
 }
 
 func (c *HttpConn) Read(b []byte) (int, error) {
@@ -84,23 +87,60 @@ func (c *HttpConn) Read(b []byte) (int, error) {
 	}
 }
 
-func (c *HttpConn) Write(b []byte) (int, error) {
-	req, err := http.NewRequest("GET", c.keyPath, bytes.NewReader(b))
-	if err != nil {
-		return 0, err
-	}
-	if c.isServer {
-		setHeadersServer(req, c.origin)
-	} else {
-		setHeadersClient(req, c.origin, c.host, c.reqUA)
-	}
-	req.ContentLength = int64(len(b))
+// func (c *HttpConn) Write(b []byte) (int, error) {
+// 	c.mu.Lock()
+// 	defer c.mu.Unlock()
+// 	req, err := http.NewRequest("GET", c.keyPath, bytes.NewReader(b))
+// 	if err != nil {
+// 		return 0, err
+// 	}
+// 	if c.isServer {
+// 		setHeadersServer(req, c.origin)
+// 	} else {
+// 		setHeadersClient(req, c.origin, c.host, c.reqUA)
+// 	}
+// 	req.ContentLength = int64(len(b))
+// 	if err := req.Write(c.w); err != nil {
+// 		return 0, err
+// 	}
+// 	if err := c.w.Flush(); err != nil {
+// 		return 0, err
+// 	}
+// 	return len(b), nil
+// }
 
-	w := bufio.NewWriter(c.Conn)
-	if err := req.Write(w); err != nil {
+func (c *HttpConn) Write(b []byte) (int, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	var headerStr string
+	if c.isServer {
+		headerStr = fmt.Sprintf("GET %s HTTP/1.1\r\n"+
+			"Cache-Control: no-store\r\n"+
+			"Content-Type: application/octet-stream\r\n"+
+			"Access-Control-Allow-Origin: %s\r\n"+
+			"Content-Length: %d\r\n\r\n", c.keyPath, c.origin, len(b))
+	} else {
+		headerStr = fmt.Sprintf("GET %s HTTP/1.1\r\n"+
+			"Host: %s\r\n"+
+			"User-Agent: %s\r\n"+
+			"Sec-Fetch-Site: cross-site\r\n"+
+			"Sec-Fetch-Mode: cors\r\n"+
+			"Sec-Fetch-Dest: empty\r\n"+
+			"Referer: %s\r\n"+
+			"Accept-Language: en-Us,en;q=0.9\r\n"+
+			"Content-Length: %d\r\n\r\n", c.keyPath, c.host, c.reqUA, c.origin, len(b))
+	}
+
+	if _, err := c.w.WriteString(headerStr); err != nil {
 		return 0, err
 	}
-	if err := w.Flush(); err != nil {
+
+	if _, err := c.w.Write(b); err != nil {
+		return 0, err
+	}
+
+	if err := c.w.Flush(); err != nil {
 		return 0, err
 	}
 
@@ -110,6 +150,13 @@ func (c *HttpConn) Write(b []byte) (int, error) {
 func (c *HttpConn) Close() error {
 	if c.body != nil {
 		c.body.Close()
+	}
+	return c.Conn.Close()
+}
+
+func (c *HttpConn) CloseWrite() error {
+	if cw, ok := c.Conn.(interface{ CloseWrite() error }); ok {
+		return cw.CloseWrite()
 	}
 	return c.Conn.Close()
 }
@@ -132,6 +179,7 @@ func (c *Client) Dial() (net.Conn, error) {
 		reqUA:    c.userAgent,
 		host:     c.serverAddr,
 		origin:   c.referer,
+		w:        bufio.NewWriter(conn),
 	}, nil
 }
 
@@ -139,9 +187,12 @@ type HttpListener struct {
 	net.Listener
 	origin  string
 	keyPath string
+
+	errs  chan error
+	conns chan net.Conn
 }
 
-func sendNginuxResponse(conn net.Conn, statusCode int) {
+func sendNginxResponse(conn net.Conn, statusCode int) {
 	conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
 	defer conn.SetWriteDeadline(time.Time{})
 
@@ -150,40 +201,54 @@ func sendNginuxResponse(conn net.Conn, statusCode int) {
 }
 
 func (l *HttpListener) Accept() (net.Conn, error) {
+	select {
+	case conn := <-l.conns:
+		return conn, nil
+	case err := <-l.errs:
+		return nil, err
+	}
+}
+
+func (l *HttpListener) startAcceptLoop() {
 	for {
 		conn, err := l.Listener.Accept()
 		if err != nil {
-			return nil, err
+			l.errs <- err
+			return
 		}
+		go l.handleHandshake(conn)
+	}
+}
 
-		conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-		reader := bufio.NewReader(conn)
+func (l *HttpListener) handleHandshake(conn net.Conn) {
+	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	reader := bufio.NewReader(conn)
 
-		req, err := http.ReadRequest(reader)
-		if err != nil {
-			fmt.Printf("[http] failed to parse request: %w\n", err)
-			sendNginuxResponse(conn, 400)
-			conn.Close()
-			continue
-		}
+	req, err := http.ReadRequest(reader)
+	if err != nil {
+		fmt.Printf("[http] failed to parse request: %w\n", err)
+		sendNginxResponse(conn, 400)
+		conn.Close()
+		return
+	}
 
-		if req.URL.Path != l.keyPath {
-			fmt.Printf("[http] Request path is not key path: %s != %s\n", req.URL.Path, l.keyPath)
-			sendNginuxResponse(conn, 404)
-			conn.Close()
-			continue
-		}
+	if req.URL.Path != l.keyPath {
+		fmt.Printf("[http] Request path is not key path: %s != %s\n", req.URL.Path, l.keyPath)
+		sendNginxResponse(conn, 404)
+		conn.Close()
+		return
+	}
 
-		conn.SetReadDeadline(time.Time{})
+	conn.SetReadDeadline(time.Time{})
 
-		return &HttpConn{
-			Conn:     conn,
-			r:        reader,
-			body:     req.Body,
-			isServer: true,
-			origin:   l.origin,
-			keyPath:  l.keyPath,
-		}, nil
+	l.conns <- &HttpConn{
+		Conn:     conn,
+		r:        reader,
+		body:     req.Body,
+		isServer: true,
+		origin:   l.origin,
+		keyPath:  l.keyPath,
+		w:        bufio.NewWriter(conn),
 	}
 }
 
@@ -193,9 +258,13 @@ func (s *Server) Listen() (net.Listener, error) {
 		return nil, err
 	}
 
-	return &HttpListener{
+	lstn := &HttpListener{
 		Listener: listener,
 		origin:   s.origin,
 		keyPath:  s.keyPath,
-	}, nil
+		conns:    make(chan net.Conn, 128),
+		errs:     make(chan error, 1),
+	}
+	go lstn.startAcceptLoop()
+	return lstn, nil
 }
